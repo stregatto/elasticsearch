@@ -1,0 +1,151 @@
+diff --git a/manifests/config.pp b/manifests/config.pp
+index 8ba86ab..f5fe807 100644
+--- a/manifests/config.pp
++++ b/manifests/config.pp
+@@ -24,6 +24,7 @@
+ #
+ class elasticsearch::config {
+ 
++  $repo_version       = $elasticsearch::repo_version
+   #### Configuration
+ 
+   File {
+diff --git a/manifests/instance.pp b/manifests/instance.pp
+index 8c879f9..d6d65ff 100644
+--- a/manifests/instance.pp
++++ b/manifests/instance.pp
+@@ -220,6 +220,14 @@ define elasticsearch::instance(
+     } else {
+       $instance_datadir = $datadir
+     }
++    # Setup logging file name for elasticsearch 5.x
++    
++    if ($elasticsearch::repo_version =~ /^5\../ ) {
++      $logging_name = 'log4j2.properties'
++    } else {
++      $logging_name = 'logging.yml'
++    }
++        
+ 
+     # Logging file or hash
+     if ($logging_file != undef) {
+@@ -241,13 +249,21 @@ define elasticsearch::instance(
+       } else {
+         $instance_logging_config = { }
+       }
+-      $logging_hash = merge($elasticsearch::params::logging_defaults, $main_logging_config, $instance_logging_config)
++      if ($elasticsearch::repo_version =~ /^5\../ ) {
++        $logging_hash = merge($elasticsearch::params::logging_defaults_es5x, $main_logging_config, $instance_logging_config)
++      } else {
++        $logging_hash = merge($elasticsearch::params::logging_defaults, $main_logging_config, $instance_logging_config)
++      }
+       if ($logging_template != undef ) {
+         $logging_content = template($logging_template)
+       } elsif ($elasticsearch::logging_template != undef) {
+         $logging_content = template($elasticsearch::logging_template)
+       } else {
+-        $logging_content = template("${module_name}/etc/elasticsearch/logging.yml.erb")
++         if ($elasticsearch::repo_version =~ /^5\../ ) {
++           $logging_content = template("${module_name}/etc/elasticsearch/log4j2.properties.erb")
++         } else {
++           $logging_content = template("${module_name}/etc/elasticsearch/logging.yml.erb")
++         }
+       }
+       $logging_source = undef
+     }
+@@ -365,7 +381,7 @@ define elasticsearch::instance(
+       before  => Elasticsearch::Service[$name],
+     }
+ 
+-    file { "${instance_configdir}/logging.yml":
++    file { "${instance_configdir}/${logging_name}":
+       ensure  => file,
+       content => $logging_content,
+       source  => $logging_source,
+diff --git a/manifests/params.pp b/manifests/params.pp
+index ce851d8..4c0af79 100644
+--- a/manifests/params.pp
++++ b/manifests/params.pp
+@@ -60,6 +60,17 @@ class elasticsearch::params {
+     'index.indexing.slowlog' => 'TRACE, index_indexing_slow_log_file',
+   }
+ 
++  $logging_defaults_es5x = {
++    'appender.console.type'                        => 'Console',
++    'appender.console.name'                        => 'console',
++    'appender.console.layout.type'                 => 'PatternLayout',
++    'appender.console.layout.pattern'              => '[%d{ISO8601}][%-5p][%-25c{1.}] %marker%m%n',
++    'rootLogger.level'                             => 'info',
++    'rootLogger.appenderRef.console.ref'           => 'console'
++  }
++
++  
++
+   $file_rolling_type = 'dailyRollingFile'
+ 
+   $daily_rolling_date_pattern = '"\'.\'yyyy-MM-dd"'
+diff --git a/manifests/service/systemd.pp b/manifests/service/systemd.pp
+index 5fc069e..c25c3e2 100644
+--- a/manifests/service/systemd.pp
++++ b/manifests/service/systemd.pp
+@@ -57,6 +57,7 @@
+ define elasticsearch::service::systemd(
+   $ensure             = $elasticsearch::ensure,
+   $status             = $elasticsearch::status,
++  $repo_version       = $elasticsearch::repo_version,
+   $init_defaults_file = undef,
+   $init_defaults      = undef,
+   $init_template      = undef,
+diff --git a/templates/etc/elasticsearch/log4j2.properties.erb b/templates/etc/elasticsearch/log4j2.properties.erb
+new file mode 100644
+index 0000000..366e4d8
+--- /dev/null
++++ b/templates/etc/elasticsearch/log4j2.properties.erb
+@@ -0,0 +1,14 @@
++# This file is managed by Puppet, do not edit manually, your changes *will* be overwritten!
++#
++# Please see the source file for context and more information:
++#
++# https://github.com/elasticsearch/elasticsearch/blob/master/config/logging.yml
++#
++
++# ----- Configuration set by Puppet ---------------------------------------------
++
++<% @logging_hash.sort.each do |key,value| %>
++<%= key %>: <%= value %>
++<% end %>
++
++# -------------------------------------------------------------------------------
+diff --git a/templates/etc/init.d/elasticsearch.RedHat.erb b/templates/etc/init.d/elasticsearch.RedHat.erb
+index ae77852..e3c95e2 100644
+--- a/templates/etc/init.d/elasticsearch.RedHat.erb
++++ b/templates/etc/init.d/elasticsearch.RedHat.erb
+@@ -89,7 +89,11 @@ start() {
+     fi
+     echo -n $"Starting $prog: "
+     # if not running, start it up here, usually something like "daemon $exec"
+-    daemon --user $ES_USER --pidfile $pidfile $exec -p $pidfile -d -Des.default.path.home=$ES_HOME -Des.default.path.logs=$LOG_DIR -Des.default.path.data=$DATA_DIR -Des.default.path.work=$WORK_DIR -Des.default.path.conf=$CONF_DIR
++    <% if @repo_version ~= /^5./  -%>
++        daemon --user $ES_USER --pidfile $pidfile $exec -p $pidfile -d -Epath.home=$ES_HOME
++    <% else %>
++        daemon --user $ES_USER --pidfile $pidfile $exec -p $pidfile -d -Des.default.path.home=$ES_HOME -Des.default.path.logs=$LOG_DIR -Des.default.path.data=$DATA_DIR -Des.default.path.work=$WORK_DIR -Des.default.path.conf=$CONF_DIR
++    <% end %>
+     retval=$?
+     echo
+     [ $retval -eq 0 ] && touch $lockfile
+diff --git a/templates/etc/init.d/elasticsearch.systemd.erb b/templates/etc/init.d/elasticsearch.systemd.erb
+index a7bde5f..3733c86 100644
+--- a/templates/etc/init.d/elasticsearch.systemd.erb
++++ b/templates/etc/init.d/elasticsearch.systemd.erb
+@@ -10,7 +10,11 @@ EnvironmentFile=<%= @defaults_location %>/elasticsearch-<%= @name %>
+ User=<%= @user %>
+ Group=<%= @group %>
+ PIDFile=<%= @pid_dir %>/elasticsearch-<%= @name %>.pid
++<% if @repo_version =~ /^5\..*/  -%>
++ExecStart=/usr/share/elasticsearch/bin/elasticsearch -d -p <%= @pid_dir %>/elasticsearch-<%= @name %>.pid -Epath.conf=${CONF_DIR}
++<% else %>
+ ExecStart=/usr/share/elasticsearch/bin/elasticsearch -d -p <%= @pid_dir %>/elasticsearch-<%= @name %>.pid -Des.default.path.home=${ES_HOME} -Des.default.path.logs=${LOG_DIR} -Des.default.path.data=${DATA_DIR} -Des.default.path.work=${WORK_DIR} -Des.default.path.conf=${CONF_DIR}
++<% end %>
+ # See MAX_OPEN_FILES in sysconfig
+ LimitNOFILE=<%= @nofile %>
+ # See MAX_LOCKED_MEMORY in sysconfig, use "infinity" when MAX_LOCKED_MEMORY=unlimited and using bootstrap.mlockall: true
